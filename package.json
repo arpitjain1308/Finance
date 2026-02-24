@@ -1,0 +1,11 @@
+{
+  "name": "finance-dashboard",
+  "version": "1.0.0",
+  "description": "AI-Powered Personal Finance Intelligence Dashboard",
+  "scripts": {
+    "install-all": "cd backend && npm install && cd ../frontend && npm install",
+    "backend": "cd backend && npm run dev",
+    "frontend": "cd frontend && npm start",
+    "ml": "cd ml-service && uvicorn main:app --reload --port 8000"
+  }
+}
