@@ -1,6 +1,7 @@
 const Transaction = require('../models/Transaction');
 const csv = require('csv-parser');
 const fs = require('fs');
+const { categorizeTransaction } = require('../utils/categorize');
 
 exports.getTransactions = async (req, res, next) => {
   try {
@@ -22,7 +23,12 @@ exports.getTransactions = async (req, res, next) => {
 
 exports.addTransaction = async (req, res, next) => {
   try {
-    const transaction = await Transaction.create({ ...req.body, user: req.user._id });
+    const data = { ...req.body, user: req.user._id };
+    // Auto-categorize if category not provided or is 'Other'
+    if (!data.category || data.category === 'Other') {
+      data.category = categorizeTransaction(data.description, data.type);
+    }
+    const transaction = await Transaction.create(data);
     res.status(201).json({ success: true, transaction });
   } catch (error) { next(error); }
 };
@@ -46,96 +52,171 @@ exports.deleteTransaction = async (req, res, next) => {
 };
 
 exports.uploadCSV = async (req, res, next) => {
-  const filePath = req.file?.path;
+  const filePath = req.file && req.file.path;
   try {
     if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
 
-    const results = [];
+    const rawContent = fs.readFileSync(filePath, 'utf8')
+      .replace(/^\uFEFF/, '')
+      .replace(/\r\n/g, '\n')
+      .replace(/\r/g, '\n');
 
+    const allLines = rawContent.split('\n');
+
+    // Find the real header row
+    const headerKeywords = ['date', 'description', 'amount', 'debit', 'credit', 'narration', 'txn', 'particulars', 'dr', 'cr', 'withdrawal', 'deposit'];
+    let headerLineIndex = -1;
+    for (let i = 0; i < allLines.length; i++) {
+      const lineLower = allLines[i].toLowerCase();
+      const matchCount = headerKeywords.filter(kw => lineLower.includes(kw)).length;
+      if (matchCount >= 2) { headerLineIndex = i; break; }
+    }
+
+    if (headerLineIndex === -1) {
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      return res.status(400).json({ success: false, message: 'Could not find transaction headers. Make sure CSV has date, description, and amount/debit/credit columns.' });
+    }
+
+    const transactionSection = allLines.slice(headerLineIndex).filter(l => l.trim()).join('\n');
+
+    const results = [];
     await new Promise((resolve, reject) => {
-      fs.createReadStream(filePath)
-        .pipe(csv({ mapHeaders: ({ header }) => header.trim().toLowerCase().replace(/\s+/g, '_') }))
-        .on('data', (data) => results.push(data))
+      const { Readable } = require('stream');
+      Readable.from([transactionSection])
+        .pipe(csv({
+          mapHeaders: ({ header }) => header.trim().toLowerCase()
+            .replace(/\uFEFF/g, '')
+            .replace(/[^a-z0-9\s]/g, '')
+            .replace(/\s+/g, '_')
+        }))
+        .on('data', (row) => results.push(row))
         .on('end', resolve)
         .on('error', reject);
     });
 
     if (results.length === 0) {
-      if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
-      return res.status(400).json({ success: false, message: 'CSV file is empty or could not be parsed' });
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      return res.status(400).json({ success: false, message: 'No transaction rows found in CSV.' });
     }
+
+    // Parse DD/MM/YYYY or standard dates
+    const parseDate = (str) => {
+      if (!str) return new Date();
+      str = str.trim();
+      const dmy = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+      if (dmy) return new Date(`${dmy[3]}-${dmy[2].padStart(2,'0')}-${dmy[1].padStart(2,'0')}`);
+      const d = new Date(str);
+      return isNaN(d.getTime()) ? new Date() : d;
+    };
+
+    const parseAmount = (val) => {
+      if (!val) return null;
+      const c = val.toString().replace(/[^0-9.\-]/g, '').trim();
+      if (!c) return null;
+      const n = parseFloat(c);
+      return isNaN(n) ? null : n;
+    };
 
     const transactions = [];
 
     for (const row of results) {
       try {
         const keys = Object.keys(row);
-
         const getVal = (...names) => {
           for (const name of names) {
             const key = keys.find(k => k.includes(name));
-            if (key && row[key]?.toString().trim()) return row[key].toString().trim();
+            if (key !== undefined) {
+              const v = row[key] && row[key].toString().trim();
+              if (v && v !== '-') return v;
+            }
           }
           return null;
         };
 
-        const rawAmount = getVal('amount', 'debit', 'credit', 'value', 'sum');
-        const desc = getVal('description', 'desc', 'narration', 'details', 'particular', 'remarks') || 'Unknown';
-        const dateVal = getVal('date', 'time', 'created');
-        const typeVal = getVal('type');
+        const desc = getVal('description', 'narration', 'particulars', 'details', 'remarks', 'note', 'desc') || 'Unknown';
+        const dateVal = getVal('txn_date', 'date', 'transaction_date', 'value_date', 'posting_date');
+        const parsedDate = parseDate(dateVal);
 
-        if (!rawAmount) continue;
+        // Separate Dr/Cr columns (Indian bank statements)
+        const drVal = parseAmount(getVal('dr_amount', 'debit', 'dr', 'withdrawal', 'withdrawl', 'debit_amount', 'chq_dr_amt'));
+        const crVal = parseAmount(getVal('cr_amount', 'credit', 'cr', 'deposit', 'credit_amount', 'chq_cr_amt'));
+        const singleAmt = parseAmount(getVal('amount', 'value', 'sum', 'transaction_amount'));
 
-        const cleanAmount = rawAmount.replace(/[₹$€£,\s]/g, '');
-        const amount = parseFloat(cleanAmount);
-        if (isNaN(amount) || amount === 0) continue;
+        let amount = 0;
+        let type = 'expense';
 
-        let type;
-        if (typeVal) {
-          type = ['income', 'credit'].some(w => typeVal.toLowerCase().includes(w)) ? 'income' : 'expense';
+        if (drVal && drVal > 0) {
+          amount = drVal; type = 'expense';
+        } else if (crVal && crVal > 0) {
+          amount = crVal; type = 'income';
+        } else if (singleAmt !== null && singleAmt !== 0) {
+          amount = Math.abs(singleAmt);
+          type = singleAmt < 0 ? 'expense' : 'income';
+          const typeVal = getVal('type', 'txn_type', 'cr_dr', 'transaction_type');
+          if (typeVal) {
+            type = ['cr','credit','income','deposit'].some(w => typeVal.toLowerCase().includes(w)) ? 'income' : 'expense';
+          }
         } else {
-          type = amount < 0 ? 'expense' : 'income';
+          continue;
         }
 
-        let parsedDate = new Date();
-        if (dateVal) {
-          const d = new Date(dateVal);
-          if (!isNaN(d.getTime())) parsedDate = d;
-        }
+        if (amount === 0) continue;
+
+        // 🧠 Smart categorization using UPI ID + merchant name
+        const category = categorizeTransaction(desc, type);
 
         transactions.push({
           user: req.user._id,
           description: desc.substring(0, 200),
-          amount: Math.abs(amount),
+          amount,
           type,
           date: parsedDate,
-          category: 'Other'
+          category
         });
-      } catch (rowErr) {
-        continue;
-      }
+      } catch (e) { continue; }
     }
 
     if (transactions.length === 0) {
-      if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
-      return res.status(400).json({ success: false, message: 'No valid transactions found. Make sure CSV has: date, description, amount columns.' });
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      return res.status(400).json({ success: false, message: 'No valid transactions found.' });
     }
+
+    // Count how many got smart-categorized vs Other
+    const categorized = transactions.filter(t => t.category !== 'Other').length;
 
     const batchSize = 100;
     for (let i = 0; i < transactions.length; i += batchSize) {
       await Transaction.insertMany(transactions.slice(i, i + batchSize), { ordered: false });
     }
 
-    if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
-
-    res.json({ success: true, message: `${transactions.length} transactions imported successfully!`, count: transactions.length });
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    res.json({
+      success: true,
+      message: `${transactions.length} transactions imported! ${categorized} auto-categorized.`,
+      count: transactions.length,
+      categorized
+    });
 
   } catch (error) {
-    if (filePath && fs.existsSync(filePath)) {
-      try { fs.unlinkSync(filePath); } catch {}
-    }
+    if (filePath && fs.existsSync(filePath)) { try { fs.unlinkSync(filePath); } catch {} }
     next(error);
   }
+};
+
+// Re-categorize all existing transactions for a user
+exports.recategorizeAll = async (req, res, next) => {
+  try {
+    const transactions = await Transaction.find({ user: req.user._id });
+    let updated = 0;
+    for (const tx of transactions) {
+      const newCategory = categorizeTransaction(tx.description, tx.type);
+      if (newCategory !== tx.category) {
+        await Transaction.findByIdAndUpdate(tx._id, { category: newCategory });
+        updated++;
+      }
+    }
+    res.json({ success: true, message: `Re-categorized ${updated} transactions out of ${transactions.length}`, updated });
+  } catch (error) { next(error); }
 };
 
 exports.getDashboardStats = async (req, res, next) => {
@@ -166,14 +247,6 @@ exports.getDashboardStats = async (req, res, next) => {
       return { income, expense, savings: income - expense };
     };
 
-    res.json({
-      success: true,
-      thisMonth: fmt(thisMonthStats),
-      lastMonth: fmt(lastMonthStats),
-      categoryBreakdown,
-      monthlyTrend,
-      recentTransactions,
-      totalTransactions
-    });
+    res.json({ success: true, thisMonth: fmt(thisMonthStats), lastMonth: fmt(lastMonthStats), categoryBreakdown, monthlyTrend, recentTransactions, totalTransactions });
   } catch (error) { next(error); }
 };
